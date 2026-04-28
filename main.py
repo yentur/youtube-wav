@@ -159,6 +159,20 @@ def video_id_from_url(url: str) -> Optional[str]:
     return None
 
 
+def resolve_cookies(path: str) -> Tuple[str, str]:
+    """Return (effective_path, status_message).
+    effective_path is "" if no usable cookies; the caller treats that as
+    "download without cookies" (public videos only)."""
+    if not path:
+        return "", "no cookies (public videos only)"
+    expanded = os.path.expanduser(path)
+    if not os.path.exists(expanded):
+        return "", f"cookies path not found: {path} → continuing without"
+    if os.path.getsize(expanded) == 0:
+        return "", f"cookies file is empty: {path} → continuing without"
+    return expanded, f"using cookies from {expanded}"
+
+
 def classify_error(exc: BaseException) -> str:
     msg = str(exc).lower()
     if any(h in msg for h in COOKIE_HINTS):
@@ -437,7 +451,7 @@ def fmt_seconds(s: Optional[float]) -> str:
     return f"{sec}s"
 
 
-def build_dashboard(stats: SessionStats, args, current_type: str, batch_progress: Progress) -> Panel:
+def build_dashboard(stats: SessionStats, args, current_type: str, batch_progress: Progress, cookies_status: str) -> Panel:
     elapsed = time.time() - stats.started_at
     total = stats.total()
     rate = total / elapsed if elapsed > 0 else 0.0
@@ -488,6 +502,11 @@ def build_dashboard(stats: SessionStats, args, current_type: str, batch_progress
             f"{rpt.get('tts', 0):,} / {rpt.get('stt', 0):,} / {rpt.get('tv', 0):,}",
             "Machines online", f"{server.get('machines_seen', 0)}",
         )
+    cookies_label = Text("Cookies", style="bold cyan")
+    cookies_text = Text(cookies_status,
+                        style="green" if cookies_status.startswith("using") else
+                              ("yellow" if "not found" in cookies_status or "empty" in cookies_status else ""))
+    table.add_row(cookies_label, cookies_text, "", "")
     if stats.last_error:
         table.add_row(Text("last err", style="red"), stats.last_error, "", "")
 
@@ -520,6 +539,15 @@ def run():
     s3 = S3Uploader(aws)
     console.print(f"[green]✓ AWS config loaded[/] (bucket=[bold]{aws['s3_bucket']}[/], region={aws.get('region')})")
 
+    cookies_path, cookies_msg = resolve_cookies(args.cookies)
+    if cookies_path:
+        console.print(f"[green]✓ {cookies_msg}[/]")
+    elif args.cookies:
+        console.print(f"[yellow]⚠ {cookies_msg}[/]")
+    else:
+        console.print(f"[dim]ℹ {cookies_msg}[/]")
+    args.cookies = cookies_path  # downstream sees "" when unusable
+
     stats = SessionStats()
     current_type = "—"
 
@@ -535,7 +563,7 @@ def run():
     )
 
     def render() -> Panel:
-        return build_dashboard(stats, args, current_type, batch_progress)
+        return build_dashboard(stats, args, current_type, batch_progress, cookies_msg)
 
     log_path = None if args.no_log_file else os.path.abspath(args.log_file)
 
