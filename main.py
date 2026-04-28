@@ -12,6 +12,7 @@ import argparse
 import csv
 import os
 import socket
+import subprocess
 import sys
 import time
 import re
@@ -59,7 +60,14 @@ def parse_args():
     p.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "8")),
                    help="Parallel downloads inside a batch")
     p.add_argument("--cookies", default=os.getenv("COOKIES_FILE", ""),
-                   help="Path to a Netscape-format cookies.txt for YouTube (optional)")
+                   help="Pin one local Netscape-format cookies.txt; "
+                        "skips the cookieless attempt and the cokk repo")
+    p.add_argument("--cookies-repo", default=os.getenv("COOKIES_REPO",
+                                                       "https://github.com/yentur/cokk.git"),
+                   help="Git repo containing fallback cookies.txt files; "
+                        "tried in order only after the cookieless attempt fails")
+    p.add_argument("--no-cookie-fallback", action="store_true",
+                   help="Disable the cookies-repo fallback entirely")
     p.add_argument("--workdir", default=os.getenv("WORKDIR", ""),
                    help="Working directory (default: a temp directory)")
     p.add_argument("--log-file", default=os.getenv("LOG_FILE", "download_log.csv"),
@@ -157,6 +165,115 @@ def video_id_from_url(url: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+class CookieJar:
+    """Cookie strategy: try cookieless first; on cookie failure, walk a
+    list of cookies.txt files cloned from a git repo, in alphabetical
+    order, until one stops yielding cookie errors. Once advanced, all
+    workers share the new index so subsequent downloads start there.
+
+    States by index:
+        -1   → cookieless
+         k   → use self.files[k]    (0-based)
+       len   → exhausted (no more cookies to try)
+    """
+
+    def __init__(self, repo_url: str, target_dir: str, enabled: bool = True):
+        self.repo_url = repo_url
+        self.target_dir = target_dir
+        self.enabled = enabled
+        self.files: List[str] = []
+        self._idx = -1
+        self._loaded = False
+        self._idx_lock = threading.Lock()
+        self._load_lock = threading.Lock()
+        self.last_error = ""
+
+    # — public state —
+    def current(self) -> Tuple[int, str]:
+        with self._idx_lock:
+            if self._idx < 0 or self._idx >= len(self.files):
+                return self._idx, ""
+            return self._idx, self.files[self._idx]
+
+    def status(self) -> str:
+        with self._idx_lock:
+            if self._idx < 0:
+                return "cookieless"
+            if self._idx >= len(self.files):
+                if self._loaded and self.files:
+                    return f"all {len(self.files)} cookies tried — exhausted"
+                return "no cookies repo"
+            return f"#{self._idx + 1}/{len(self.files)}: {os.path.basename(self.files[self._idx])}"
+
+    # — advancing the strategy —
+    def advance(self, used_idx: int) -> Tuple[int, str]:
+        """Move to the next cookie if (and only if) `used_idx` is still
+        the active one. Lazy-loads the repo on the first transition
+        out of cookieless. Returns the new (idx, path)."""
+        if not self.enabled:
+            return used_idx, ""
+
+        # Lazy-load the repo before transitioning past cookieless.
+        if not self._loaded:
+            self._ensure_loaded()
+
+        with self._idx_lock:
+            if used_idx != self._idx:
+                # Another worker already advanced past us — adopt theirs.
+                if 0 <= self._idx < len(self.files):
+                    return self._idx, self.files[self._idx]
+                return self._idx, ""
+            self._idx += 1
+            if self._idx >= len(self.files):
+                return self._idx, ""
+            return self._idx, self.files[self._idx]
+
+    # — load —
+    def _ensure_loaded(self):
+        with self._load_lock:
+            if self._loaded:
+                return
+            self._loaded = True  # mark first so we don't retry on failure
+            try:
+                if os.path.exists(os.path.join(self.target_dir, ".git")):
+                    subprocess.run(
+                        ["git", "-C", self.target_dir, "pull", "--quiet"],
+                        check=True, timeout=60, capture_output=True,
+                    )
+                else:
+                    parent = os.path.dirname(self.target_dir) or "."
+                    os.makedirs(parent, exist_ok=True)
+                    subprocess.run(
+                        ["git", "clone", "--depth=1", "--quiet",
+                         self.repo_url, self.target_dir],
+                        check=True, timeout=120, capture_output=True,
+                    )
+                cands = sorted(
+                    glob.glob(os.path.join(self.target_dir, "*.txt")) +
+                    glob.glob(os.path.join(self.target_dir, "**/*.txt"), recursive=True)
+                )
+                seen = set()
+                files: List[str] = []
+                for p in cands:
+                    rp = os.path.realpath(p)
+                    if rp in seen:
+                        continue
+                    seen.add(rp)
+                    if os.path.basename(p).lower() == "readme.md":
+                        continue
+                    if os.path.getsize(p) <= 0:
+                        continue
+                    files.append(p)
+                self.files = files
+            except subprocess.TimeoutExpired:
+                self.last_error = "timeout"
+            except subprocess.CalledProcessError as e:
+                stderr = (e.stderr or b"").decode(errors="replace")[:200]
+                self.last_error = f"clone failed: {stderr or e}"
+            except Exception as e:
+                self.last_error = f"load error: {e}"
 
 
 def resolve_cookies(path: str) -> Tuple[str, str]:
@@ -321,27 +438,19 @@ class DLResult:
     elapsed_sec: float = 0.0
 
 
-def download_one(
+def _attempt_download(
     link: str,
+    vid: str,
     vtype: str,
     workdir: str,
     s3: S3Uploader,
     cookies_file: str,
     keep_files: bool,
+    t0: float,
 ) -> DLResult:
-    t0 = time.time()
-    vid = video_id_from_url(link)
-    if not vid:
-        return DLResult(link, "error", error="bad_url", error_type="extract",
-                        elapsed_sec=time.time() - t0)
-
+    """Single download+upload attempt with one specific cookies file (or none)."""
     wav_key = f"{vtype}/{vid}.wav"
     srt_key = f"{vtype}/{vid}.srt"
-
-    # Skip-if-exists: if the WAV is already on S3, mark as skipped.
-    if s3.exists(wav_key):
-        return DLResult(link, "skipped", s3_url=f"s3://{s3.bucket}/{wav_key}",
-                        video_id=vid, elapsed_sec=time.time() - t0)
 
     # Per-video temp directory so parallel workers don't collide.
     vdir = tempfile.mkdtemp(prefix=f"yt_{vid}_", dir=workdir)
@@ -429,6 +538,55 @@ def download_one(
                 pass
 
 
+def download_one(
+    link: str,
+    vtype: str,
+    workdir: str,
+    s3: S3Uploader,
+    cookie_jar: CookieJar,
+    keep_files: bool,
+    on_advance=None,
+) -> DLResult:
+    """Strategy: try cookieless first; on a cookie error, walk through the
+    cookies repo files in order until one stops returning cookie errors.
+    The shared CookieJar means once a worker advances, all later workers
+    start from the new index for free."""
+    t0 = time.time()
+    vid = video_id_from_url(link)
+    if not vid:
+        return DLResult(link, "error", error="bad_url", error_type="extract",
+                        elapsed_sec=time.time() - t0)
+
+    wav_key = f"{vtype}/{vid}.wav"
+
+    # Skip-if-exists: avoid wasting any cookie attempt.
+    if s3.exists(wav_key):
+        return DLResult(link, "skipped", s3_url=f"s3://{s3.bucket}/{wav_key}",
+                        video_id=vid, elapsed_sec=time.time() - t0)
+
+    last_result: Optional[DLResult] = None
+    while True:
+        idx, cookies_file = cookie_jar.current()
+        result = _attempt_download(
+            link, vid, vtype, workdir, s3, cookies_file, keep_files, t0,
+        )
+        if result.error_type != "cookie":
+            return result
+
+        # Cookie error → try advancing the jar.
+        last_result = result
+        new_idx, new_cookie = cookie_jar.advance(idx)
+        moved = (new_idx != idx) or (new_cookie != cookies_file)
+        if moved and on_advance:
+            try:
+                on_advance(new_idx, new_cookie)
+            except Exception:
+                pass
+        if not new_cookie:
+            # nothing more to try (disabled, exhausted, or repo empty)
+            return last_result
+
+
 # ── UI rendering ───────────────────────────────────────────────────────────────
 def fmt_bytes(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -503,10 +661,15 @@ def build_dashboard(stats: SessionStats, args, current_type: str, batch_progress
             "Machines online", f"{server.get('machines_seen', 0)}",
         )
     cookies_label = Text("Cookies", style="bold cyan")
-    cookies_text = Text(cookies_status,
-                        style="green" if cookies_status.startswith("using") else
-                              ("yellow" if "not found" in cookies_status or "empty" in cookies_status else ""))
-    table.add_row(cookies_label, cookies_text, "", "")
+    if cookies_status.startswith("cookieless"):
+        c_style = "dim"
+    elif cookies_status.startswith("#"):
+        c_style = "green"
+    elif "exhausted" in cookies_status:
+        c_style = "red"
+    else:
+        c_style = "yellow"
+    table.add_row(cookies_label, Text(cookies_status, style=c_style), "", "")
     if stats.last_error:
         table.add_row(Text("last err", style="red"), stats.last_error, "", "")
 
@@ -539,28 +702,30 @@ def run():
     s3 = S3Uploader(aws)
     console.print(f"[green]✓ AWS config loaded[/] (bucket=[bold]{aws['s3_bucket']}[/], region={aws.get('region')})")
 
-    # Cookies precedence: local --cookies (if usable) > server-provided > none.
-    cookies_path, cookies_msg = resolve_cookies(args.cookies)
-    if cookies_path:
-        console.print(f"[green]✓ {cookies_msg}[/]")
-    elif args.cookies:
-        console.print(f"[yellow]⚠ {cookies_msg}[/] — falling back to server cookies if available")
-
-    if not cookies_path:
-        server_cookies = (config.get("cookies") or "").strip()
-        if server_cookies:
-            server_path = os.path.join(workdir, "server_cookies.txt")
-            with open(server_path, "w", encoding="utf-8") as f:
-                f.write(config["cookies"])
-            os.chmod(server_path, 0o600)
-            cookies_path = server_path
-            cookies_msg = f"using cookies from server ({len(server_cookies)} bytes)"
-            console.print(f"[green]✓ {cookies_msg}[/]")
+    # Cookie strategy: pinned-local > cookieless-first-then-cokk-repo.
+    cookies_repo_dir = os.path.join(workdir, "cokk")
+    pinned_path, pinned_msg = resolve_cookies(args.cookies)
+    if pinned_path:
+        # User pinned a local file → no cookieless attempt, no repo fallback.
+        cookie_jar = CookieJar("(pinned)", cookies_repo_dir, enabled=False)
+        cookie_jar.files = [pinned_path]
+        cookie_jar._loaded = True
+        cookie_jar._idx = 0
+        console.print(f"[green]✓ {pinned_msg}[/] (pinned, no fallback)")
+    else:
+        if args.cookies:
+            console.print(f"[yellow]⚠ {pinned_msg}[/] — falling back to cookieless-first strategy")
+        cookie_jar = CookieJar(
+            args.cookies_repo, cookies_repo_dir,
+            enabled=not args.no_cookie_fallback,
+        )
+        if cookie_jar.enabled:
+            console.print(
+                f"[dim]ℹ starting cookieless; fallback repo on first cookie error: "
+                f"[bold]{args.cookies_repo}[/][/]"
+            )
         else:
-            cookies_msg = "no cookies (server has none, public videos only)"
-            console.print(f"[dim]ℹ {cookies_msg}[/]")
-
-    args.cookies = cookies_path  # downstream sees "" only when truly nothing usable
+            console.print("[dim]ℹ starting cookieless; cookie-repo fallback disabled[/]")
 
     stats = SessionStats()
     current_type = "—"
@@ -577,7 +742,7 @@ def run():
     )
 
     def render() -> Panel:
-        return build_dashboard(stats, args, current_type, batch_progress, cookies_msg)
+        return build_dashboard(stats, args, current_type, batch_progress, cookie_jar.status())
 
     log_path = None if args.no_log_file else os.path.abspath(args.log_file)
 
@@ -622,11 +787,24 @@ def run():
             results: List[DLResult] = []
             done_in_batch = 0
 
+            def on_cookie_advance(new_idx, new_path):
+                if new_path:
+                    logger.emit(
+                        "warn",
+                        f"cookie rotation → #{new_idx + 1}/{len(cookie_jar.files)}: "
+                        f"{os.path.basename(new_path)}",
+                    )
+                else:
+                    if cookie_jar.last_error:
+                        logger.emit("warn", f"cookies repo: {cookie_jar.last_error}")
+                    else:
+                        logger.emit("warn", "all cookies tried — no working cookie")
+
             with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
                 futures = {
                     pool.submit(
                         download_one, link, current_type, workdir, s3,
-                        args.cookies, args.keep_files,
+                        cookie_jar, args.keep_files, on_cookie_advance,
                     ): link
                     for link in links
                 }
