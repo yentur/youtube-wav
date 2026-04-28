@@ -51,9 +51,9 @@ def parse_args():
                    help="Orchestrator base URL")
     p.add_argument("--machine-id", default=os.getenv("MACHINE_ID", socket.gethostname()),
                    help="Unique id for this client")
-    p.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", "10")),
+    p.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", "64")),
                    help="How many links to pull per batch")
-    p.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "4")),
+    p.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "8")),
                    help="Parallel downloads inside a batch")
     p.add_argument("--cookies", default=os.getenv("COOKIES_FILE", ""),
                    help="Path to a Netscape-format cookies.txt for YouTube (optional)")
