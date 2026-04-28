@@ -58,8 +58,6 @@ def parse_args():
                    help="How many links to pull per batch")
     p.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "8")),
                    help="Parallel downloads inside a batch")
-    p.add_argument("--cookies", default=os.getenv("COOKIES_FILE", ""),
-                   help="Path to a Netscape-format cookies.txt for YouTube (optional)")
     p.add_argument("--workdir", default=os.getenv("WORKDIR", ""),
                    help="Working directory (default: a temp directory)")
     p.add_argument("--log-file", default=os.getenv("LOG_FILE", "download_log.csv"),
@@ -135,6 +133,14 @@ COOKIE_HINTS = (
     "login required",
     "cookies",
 )
+RATELIMIT_HINTS = (
+    "rate-limited",
+    "rate limited",
+    "rate limit",
+    "too many requests",
+    "try again later",
+    "http error 429",
+)
 
 
 class _SilentLogger:
@@ -159,22 +165,12 @@ def video_id_from_url(url: str) -> Optional[str]:
     return None
 
 
-def resolve_cookies(path: str) -> Tuple[str, str]:
-    """Return (effective_path, status_message).
-    effective_path is "" if no usable cookies; the caller treats that as
-    "download without cookies" (public videos only)."""
-    if not path:
-        return "", "no cookies (public videos only)"
-    expanded = os.path.expanduser(path)
-    if not os.path.exists(expanded):
-        return "", f"cookies path not found: {path} → continuing without"
-    if os.path.getsize(expanded) == 0:
-        return "", f"cookies file is empty: {path} → continuing without"
-    return expanded, f"using cookies from {expanded}"
-
-
 def classify_error(exc: BaseException) -> str:
     msg = str(exc).lower()
+    # Rate-limit must win over both 'extract' (msg often says 'unavailable')
+    # and 'cookie' (the 429 path also matches 'http error 4').
+    if any(h in msg for h in RATELIMIT_HINTS):
+        return "ratelimit"
     if any(h in msg for h in COOKIE_HINTS):
         return "cookie"
     if "http error 4" in msg or "forbidden" in msg or "unauthorized" in msg:
@@ -195,6 +191,7 @@ class SessionStats:
     skipped: int = 0
     failed: int = 0
     cookie_errors: int = 0
+    ratelimit_errors: int = 0
     bytes_uploaded: int = 0
     last_error: str = ""
     server_stats: dict = field(default_factory=dict)
@@ -210,6 +207,8 @@ class SessionStats:
                 self.failed += 1
                 if err_type == "cookie":
                     self.cookie_errors += 1
+                elif err_type == "ratelimit":
+                    self.ratelimit_errors += 1
                 if err:
                     self.last_error = err[:120]
             self.bytes_uploaded += bytes_up
@@ -326,7 +325,6 @@ def download_one(
     vtype: str,
     workdir: str,
     s3: S3Uploader,
-    cookies_file: str,
     keep_files: bool,
 ) -> DLResult:
     t0 = time.time()
@@ -359,8 +357,6 @@ def download_one(
             "logger": _SilentLogger(),
             "noprogress": True,
         }
-        if cookies_file and os.path.exists(cookies_file):
-            common["cookiefile"] = cookies_file
 
         # 1) audio → wav 16 kHz
         ydl_audio = {
@@ -451,7 +447,7 @@ def fmt_seconds(s: Optional[float]) -> str:
     return f"{sec}s"
 
 
-def build_dashboard(stats: SessionStats, args, current_type: str, batch_progress: Progress, cookies_status: str) -> Panel:
+def build_dashboard(stats: SessionStats, args, current_type: str, batch_progress: Progress) -> Panel:
     elapsed = time.time() - stats.started_at
     total = stats.total()
     rate = total / elapsed if elapsed > 0 else 0.0
@@ -485,7 +481,8 @@ def build_dashboard(stats: SessionStats, args, current_type: str, batch_progress
     )
     table.add_row(
         Text("✗ failed", style="red"), f"{stats.failed}",
-        Text("⚿ cookie-errs", style="yellow"), f"{stats.cookie_errors}",
+        Text("🚦 rate-limit / ⚿ auth", style="yellow"),
+        f"{stats.ratelimit_errors} / {stats.cookie_errors}",
     )
     table.add_row(
         "Uploaded", fmt_bytes(stats.bytes_uploaded),
@@ -502,11 +499,6 @@ def build_dashboard(stats: SessionStats, args, current_type: str, batch_progress
             f"{rpt.get('tts', 0):,} / {rpt.get('stt', 0):,} / {rpt.get('tv', 0):,}",
             "Machines online", f"{server.get('machines_seen', 0)}",
         )
-    cookies_label = Text("Cookies", style="bold cyan")
-    cookies_text = Text(cookies_status,
-                        style="green" if cookies_status.startswith("using") else
-                              ("yellow" if "not found" in cookies_status or "empty" in cookies_status else ""))
-    table.add_row(cookies_label, cookies_text, "", "")
     if stats.last_error:
         table.add_row(Text("last err", style="red"), stats.last_error, "", "")
 
@@ -539,29 +531,6 @@ def run():
     s3 = S3Uploader(aws)
     console.print(f"[green]✓ AWS config loaded[/] (bucket=[bold]{aws['s3_bucket']}[/], region={aws.get('region')})")
 
-    # Cookies precedence: local --cookies (if usable) > server-provided > none.
-    cookies_path, cookies_msg = resolve_cookies(args.cookies)
-    if cookies_path:
-        console.print(f"[green]✓ {cookies_msg}[/]")
-    elif args.cookies:
-        console.print(f"[yellow]⚠ {cookies_msg}[/] — falling back to server cookies if available")
-
-    if not cookies_path:
-        server_cookies = (config.get("cookies") or "").strip()
-        if server_cookies:
-            server_path = os.path.join(workdir, "server_cookies.txt")
-            with open(server_path, "w", encoding="utf-8") as f:
-                f.write(config["cookies"])
-            os.chmod(server_path, 0o600)
-            cookies_path = server_path
-            cookies_msg = f"using cookies from server ({len(server_cookies)} bytes)"
-            console.print(f"[green]✓ {cookies_msg}[/]")
-        else:
-            cookies_msg = "no cookies (server has none, public videos only)"
-            console.print(f"[dim]ℹ {cookies_msg}[/]")
-
-    args.cookies = cookies_path  # downstream sees "" only when truly nothing usable
-
     stats = SessionStats()
     current_type = "—"
 
@@ -577,7 +546,7 @@ def run():
     )
 
     def render() -> Panel:
-        return build_dashboard(stats, args, current_type, batch_progress, cookies_msg)
+        return build_dashboard(stats, args, current_type, batch_progress)
 
     log_path = None if args.no_log_file else os.path.abspath(args.log_file)
 
@@ -626,7 +595,7 @@ def run():
                 futures = {
                     pool.submit(
                         download_one, link, current_type, workdir, s3,
-                        args.cookies, args.keep_files,
+                        args.keep_files,
                     ): link
                     for link in links
                 }

@@ -31,26 +31,18 @@ export API_TOKEN='<shared secret from the orchestrator owner>'
 
 python main.py \
   --api http://51.102.128.158:8000 \
-  --batch-size 10 \
-  --concurrency 4 \
+  --batch-size 64 \
+  --concurrency 8 \
   --machine-id $(hostname)
 ```
 
 All flags can also come from env vars: `API_BASE_URL`, `API_TOKEN`,
-`BATCH_SIZE`, `CONCURRENCY`, `MACHINE_ID`, `COOKIES_FILE`, `WORKDIR`.
+`BATCH_SIZE`, `CONCURRENCY`, `MACHINE_ID`, `WORKDIR`, `LOG_FILE`.
 
 The orchestrator hands out AWS credentials and link batches **only** to
 clients that present the right token via `Authorization: Bearer <token>`
 (or `X-API-Token`). Without it `/config`, `/batch`, `/report` all return
 `401`. Ask the operator for the token; never check it into git.
-
-### Optional: cookies for age-restricted / region-locked videos
-
-Pass a Netscape-format `cookies.txt`:
-
-```bash
-python main.py --cookies /path/to/www.youtube.com_cookies.txt
-```
 
 ## Flags
 
@@ -59,10 +51,11 @@ python main.py --cookies /path/to/www.youtube.com_cookies.txt
 | `--api`          | `http://51.102.128.158:8000`  | Orchestrator base URL                |
 | `--token`        | _(env `API_TOKEN`)_           | Shared secret for the orchestrator   |
 | `--machine-id`   | `$(hostname)`                 | Unique id reported back to server    |
-| `--batch-size`   | `10`                          | Links pulled per `/batch` call       |
-| `--concurrency`  | `4`                           | Parallel downloads inside a batch    |
-| `--cookies`      | _(none)_                      | Path to a YouTube `cookies.txt`      |
+| `--batch-size`   | `64`                          | Links pulled per `/batch` call       |
+| `--concurrency`  | `8`                           | Parallel downloads inside a batch    |
 | `--workdir`      | _(temp dir)_                  | Where to stage downloads             |
+| `--log-file`     | `download_log.csv`            | Per-video CSV log path               |
+| `--no-log-file`  | off                           | Disable the CSV log                  |
 | `--keep-files`   | off                           | Don't delete WAV/SRT after upload    |
 
 ## Output
@@ -81,14 +74,29 @@ the row's `type` column in the master `videolist.csv`.
 
 Built with [rich](https://github.com/Textualize/rich): a single panel shows
 machine id, active type, success/skip/fail counters, upload throughput,
-server-side total + ETA, and remaining links per type.
+server-side total + ETA, and remaining links per type. Per-video status
+lines stream above the dashboard:
+
+```
+▶ batch #N [type] pulled K links
+✓ #N·k/K [type] <video_id> <bytes> in Xs
+⤼ #N·k/K [type] <video_id> already on S3
+✗ #N·k/K [type] <video_id> <error_class>: <short err>
+▶ batch #N done in Xs — n ok / n skip / n fail
+```
 
 ## Retry / failure semantics
 
-- The orchestrator marks a link **final-failed** once **3 different
-  machines** have failed it (and the failure isn't a cookie/auth error).
-- Cookie/auth failures are not counted toward the 3-strike limit — the link
-  is re-queued so a different machine (with different cookies) can try.
+- **Transient errors** are not counted toward the fail limit — the link
+  goes back into the orchestrator's queue immediately. The two transient
+  classes are:
+  - `cookie` (auth / login walls / age-gate)
+  - `ratelimit` (YouTube 429 / "session has been rate-limited")
+- A link is finally marked `failed` only after **3 different machines**
+  hit a non-transient error on it (`extract`, `network`, `other`).
+- Previously-failed links are re-queued automatically when the
+  orchestrator restarts; only `success` and `skipped` rows in
+  `results.csv` are treated as final.
 - Already-uploaded links (WAV present on S3) are reported as `skipped` so
   no work is duplicated when a machine restarts.
 
@@ -100,9 +108,10 @@ server-side total + ETA, and remaining links per type.
 
 ## Troubleshooting
 
-| Symptom                                    | Try                                       |
-|--------------------------------------------|-------------------------------------------|
-| Lots of `cookie` errors                    | Pass `--cookies cookies.txt`              |
-| `wav_missing` errors                       | `apt install ffmpeg`                      |
-| Hangs on `boto3` upload                    | Check egress firewall / S3 credentials    |
-| `get_batch` retries                        | Server URL wrong or server down           |
+| Symptom                                  | Try                                            |
+|------------------------------------------|------------------------------------------------|
+| Lots of `ratelimit` errors               | Run from more / different IPs; reduce concurrency |
+| Lots of `cookie`-classed auth errors     | Datacenter IPs are bot-blocked; use residential / vast.ai |
+| `wav_missing` errors                     | `apt install ffmpeg`                           |
+| Hangs on `boto3` upload                  | Check egress firewall / S3 credentials         |
+| `get_batch` retries                      | Server URL wrong or server down                |
