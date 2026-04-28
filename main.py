@@ -66,6 +66,10 @@ def parse_args():
                                                        "https://github.com/yentur/cokk.git"),
                    help="Git repo containing fallback cookies.txt files; "
                         "tried in order only after the cookieless attempt fails")
+    p.add_argument("--cookies-repo-token",
+                   default=os.getenv("COOKIES_REPO_TOKEN") or os.getenv("GITHUB_TOKEN") or "",
+                   help="GitHub token for cloning a private cookies repo "
+                        "(reads env COOKIES_REPO_TOKEN, then GITHUB_TOKEN)")
     p.add_argument("--no-cookie-fallback", action="store_true",
                    help="Disable the cookies-repo fallback entirely")
     p.add_argument("--workdir", default=os.getenv("WORKDIR", ""),
@@ -179,16 +183,33 @@ class CookieJar:
        len   → exhausted (no more cookies to try)
     """
 
-    def __init__(self, repo_url: str, target_dir: str, enabled: bool = True):
+    def __init__(self, repo_url: str, target_dir: str, enabled: bool = True,
+                 token: str = ""):
         self.repo_url = repo_url
         self.target_dir = target_dir
         self.enabled = enabled
+        self.token = token or ""
         self.files: List[str] = []
         self._idx = -1
         self._loaded = False
         self._idx_lock = threading.Lock()
         self._load_lock = threading.Lock()
         self.last_error = ""
+
+    def _authed_url(self) -> str:
+        """Inject the token into an https URL so private repos can be cloned
+        without a credential helper. SSH URLs are left alone."""
+        if not self.token or not self.repo_url.startswith("https://"):
+            return self.repo_url
+        return self.repo_url.replace(
+            "https://", f"https://x-access-token:{self.token}@", 1,
+        )
+
+    def _scrub(self, text: str) -> str:
+        """Strip the token from any text we might log."""
+        if self.token and self.token in text:
+            text = text.replace(self.token, "***")
+        return text
 
     # — public state —
     def current(self) -> Tuple[int, str]:
@@ -236,19 +257,23 @@ class CookieJar:
             if self._loaded:
                 return
             self._loaded = True  # mark first so we don't retry on failure
+            url = self._authed_url()
+            # Don't let git prompt for a password; fail fast instead.
+            env = os.environ.copy()
+            env["GIT_TERMINAL_PROMPT"] = "0"
             try:
                 if os.path.exists(os.path.join(self.target_dir, ".git")):
                     subprocess.run(
                         ["git", "-C", self.target_dir, "pull", "--quiet"],
-                        check=True, timeout=60, capture_output=True,
+                        check=True, timeout=60, capture_output=True, env=env,
                     )
                 else:
                     parent = os.path.dirname(self.target_dir) or "."
                     os.makedirs(parent, exist_ok=True)
                     subprocess.run(
                         ["git", "clone", "--depth=1", "--quiet",
-                         self.repo_url, self.target_dir],
-                        check=True, timeout=120, capture_output=True,
+                         url, self.target_dir],
+                        check=True, timeout=120, capture_output=True, env=env,
                     )
                 cands = sorted(
                     glob.glob(os.path.join(self.target_dir, "*.txt")) +
@@ -271,9 +296,15 @@ class CookieJar:
                 self.last_error = "timeout"
             except subprocess.CalledProcessError as e:
                 stderr = (e.stderr or b"").decode(errors="replace")[:200]
-                self.last_error = f"clone failed: {stderr or e}"
+                stderr = self._scrub(stderr)
+                hint = ""
+                low = stderr.lower()
+                if "authentication" in low or "could not read" in low or "403" in low or "401" in low:
+                    hint = (" — set COOKIES_REPO_TOKEN or GITHUB_TOKEN env "
+                            "(or pass --cookies-repo-token)")
+                self.last_error = f"clone failed: {stderr or e}{hint}"
             except Exception as e:
-                self.last_error = f"load error: {e}"
+                self.last_error = self._scrub(f"load error: {e}")
 
 
 def resolve_cookies(path: str) -> Tuple[str, str]:
@@ -718,11 +749,21 @@ def run():
         cookie_jar = CookieJar(
             args.cookies_repo, cookies_repo_dir,
             enabled=not args.no_cookie_fallback,
+            token=args.cookies_repo_token,
         )
         if cookie_jar.enabled:
+            auth_note = ""
+            if args.cookies_repo.startswith("https://"):
+                if args.cookies_repo_token:
+                    src = ("env COOKIES_REPO_TOKEN" if os.getenv("COOKIES_REPO_TOKEN")
+                           else "env GITHUB_TOKEN" if os.getenv("GITHUB_TOKEN")
+                           else "--cookies-repo-token")
+                    auth_note = f" [green](auth: {src})[/]"
+                else:
+                    auth_note = " [yellow](no token; private repo will fail)[/]"
             console.print(
                 f"[dim]ℹ starting cookieless; fallback repo on first cookie error: "
-                f"[bold]{args.cookies_repo}[/][/]"
+                f"[bold]{args.cookies_repo}[/]{auth_note}[/]"
             )
         else:
             console.print("[dim]ℹ starting cookieless; cookie-repo fallback disabled[/]")
