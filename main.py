@@ -9,6 +9,7 @@ back. Designed to run on many VPSes / GPU boxes in parallel.
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import socket
 import sys
@@ -61,12 +62,65 @@ def parse_args():
                    help="Path to a Netscape-format cookies.txt for YouTube (optional)")
     p.add_argument("--workdir", default=os.getenv("WORKDIR", ""),
                    help="Working directory (default: a temp directory)")
+    p.add_argument("--log-file", default=os.getenv("LOG_FILE", "download_log.csv"),
+                   help="Per-video CSV log path (default: ./download_log.csv)")
+    p.add_argument("--no-log-file", action="store_true",
+                   help="Disable CSV log file")
     p.add_argument("--keep-files", action="store_true",
                    help="Keep downloaded WAV/SRT files after upload (debug)")
     return p.parse_args()
 
 
-console = Console()
+console = Console(log_path=False)
+
+
+# ── Logging helpers ────────────────────────────────────────────────────────────
+LOG_STYLES = {
+    "info":    ("ℹ",  ""),
+    "batch":   ("▶",  "bold cyan"),
+    "start":   ("⤓",  "cyan"),
+    "success": ("✓",  "green"),
+    "skip":    ("⤼",  "yellow"),
+    "error":   ("✗",  "red"),
+    "warn":    ("!",  "yellow"),
+}
+
+
+class EventLogger:
+    """Prints scrolling status lines above the rich Live dashboard
+    and (optionally) appends a CSV row per video result."""
+
+    def __init__(self, live: "Live", log_path: Optional[str]):
+        self.live = live
+        self.log_path = log_path
+        self._csv_lock = threading.Lock()
+        self._console_lock = threading.Lock()
+        if self.log_path:
+            new = not os.path.exists(self.log_path)
+            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
+            with open(self.log_path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow([
+                        "timestamp", "machine_id", "batch_no", "type",
+                        "video_id", "link", "status", "error_type",
+                        "s3_url", "bytes", "elapsed_sec", "error",
+                    ])
+
+    def emit(self, kind: str, msg: str) -> None:
+        icon, style = LOG_STYLES.get(kind, ("•", ""))
+        text = f"{icon} {msg}"
+        if style:
+            text = f"[{style}]{text}[/]"
+        with self._console_lock:
+            self.live.console.log(text)
+
+    def csv_row(self, row: List[object]) -> None:
+        if not self.log_path:
+            return
+        with self._csv_lock:
+            with open(self.log_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(row)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -249,6 +303,8 @@ class DLResult:
     error: str = ""
     error_type: str = ""
     bytes_uploaded: int = 0
+    video_id: str = ""
+    elapsed_sec: float = 0.0
 
 
 def download_one(
@@ -259,16 +315,19 @@ def download_one(
     cookies_file: str,
     keep_files: bool,
 ) -> DLResult:
+    t0 = time.time()
     vid = video_id_from_url(link)
     if not vid:
-        return DLResult(link, "error", error="bad_url", error_type="extract")
+        return DLResult(link, "error", error="bad_url", error_type="extract",
+                        elapsed_sec=time.time() - t0)
 
     wav_key = f"{vtype}/{vid}.wav"
     srt_key = f"{vtype}/{vid}.srt"
 
     # Skip-if-exists: if the WAV is already on S3, mark as skipped.
     if s3.exists(wav_key):
-        return DLResult(link, "skipped", s3_url=f"s3://{s3.bucket}/{wav_key}")
+        return DLResult(link, "skipped", s3_url=f"s3://{s3.bucket}/{wav_key}",
+                        video_id=vid, elapsed_sec=time.time() - t0)
 
     # Per-video temp directory so parallel workers don't collide.
     vdir = tempfile.mkdtemp(prefix=f"yt_{vid}_", dir=workdir)
@@ -304,7 +363,9 @@ def download_one(
             with yt_dlp.YoutubeDL(ydl_audio) as ydl:
                 ydl.download([link])
         except Exception as e:
-            return DLResult(link, "error", error=str(e)[:300], error_type=classify_error(e))
+            return DLResult(link, "error", error=str(e)[:300],
+                            error_type=classify_error(e),
+                            video_id=vid, elapsed_sec=time.time() - t0)
 
         if not os.path.exists(wav_path):
             # ffmpeg may have emitted with a slightly different name; pick first wav
@@ -312,7 +373,8 @@ def download_one(
             if cands:
                 wav_path = cands[0]
             else:
-                return DLResult(link, "error", error="wav_missing", error_type="extract")
+                return DLResult(link, "error", error="wav_missing", error_type="extract",
+                                video_id=vid, elapsed_sec=time.time() - t0)
 
         # 2) try auto-subtitle (best-effort; non-fatal)
         srt_uploaded = ""
@@ -337,11 +399,13 @@ def download_one(
         try:
             wav_url, wav_size = s3.upload(wav_path, wav_key)
         except Exception as e:
-            return DLResult(link, "error", error=f"s3:{e}"[:300], error_type="other")
+            return DLResult(link, "error", error=f"s3:{e}"[:300], error_type="other",
+                            video_id=vid, elapsed_sec=time.time() - t0)
 
         return DLResult(
             link, "success", s3_url=wav_url, bytes_uploaded=wav_size,
             error=("srt:" + srt_uploaded) if srt_uploaded else "",
+            video_id=vid, elapsed_sec=time.time() - t0,
         )
     finally:
         if not keep_files:
@@ -473,12 +537,19 @@ def run():
     def render() -> Panel:
         return build_dashboard(stats, args, current_type, batch_progress)
 
+    log_path = None if args.no_log_file else os.path.abspath(args.log_file)
+
     with Live(render(), refresh_per_second=4, console=console) as live:
+        logger = EventLogger(live, log_path)
+        if log_path:
+            logger.emit("info", f"per-video log: [bold]{log_path}[/]")
+
         while True:
             try:
                 resp = api.get_batch(args.batch_size)
             except Exception as e:
                 stats.last_error = f"get_batch: {e}"[:120]
+                logger.emit("warn", f"get_batch failed: {e}; retry in 5s")
                 live.update(render())
                 time.sleep(5)
                 continue
@@ -486,6 +557,7 @@ def run():
             if resp.get("status") == "no_more_videos":
                 stats.server_stats = resp.get("stats") or stats.server_stats
                 live.update(render())
+                logger.emit("info", "server reports no more videos")
                 console.print("[bold green]🏁 server reports no more videos[/]")
                 break
 
@@ -493,11 +565,20 @@ def run():
             batch_id = resp["batch_id"]
             current_type = resp["type"]
             links: List[str] = resp["links"]
+            batch_no = stats.batches
+
+            logger.emit(
+                "batch",
+                f"batch #{batch_no} [{current_type}] pulled {len(links)} links "
+                f"(id {batch_id[:8]})",
+            )
+            batch_t0 = time.time()
 
             task_id = batch_progress.add_task(
-                f"batch #{stats.batches} [{current_type}]", total=len(links),
+                f"batch #{batch_no} [{current_type}]", total=len(links),
             )
             results: List[DLResult] = []
+            done_in_batch = 0
 
             with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
                 futures = {
@@ -516,14 +597,58 @@ def run():
                             link, "error",
                             error=f"{type(e).__name__}:{e}"[:300],
                             error_type=classify_error(e),
+                            video_id=video_id_from_url(link) or "",
                         )
                     results.append(r)
                     stats.add(
                         r.status, bytes_up=r.bytes_uploaded,
                         err=r.error, err_type=r.error_type,
                     )
+                    done_in_batch += 1
+
+                    vid_label = r.video_id or (link[-11:])
+                    pos = f"#{batch_no}·{done_in_batch}/{len(links)}"
+                    if r.status == "success":
+                        logger.emit(
+                            "success",
+                            f"{pos} [{current_type}] {vid_label}  "
+                            f"{fmt_bytes(r.bytes_uploaded)} in {r.elapsed_sec:.1f}s",
+                        )
+                    elif r.status == "skipped":
+                        logger.emit(
+                            "skip",
+                            f"{pos} [{current_type}] {vid_label}  already on S3",
+                        )
+                    else:
+                        # strip noisy yt-dlp prefix and trim
+                        msg = (r.error or "").replace("ERROR: ", "").strip()
+                        msg = re.sub(r"\s+", " ", msg)[:80]
+                        logger.emit(
+                            "error",
+                            f"{pos} [{current_type}] {vid_label}  "
+                            f"{r.error_type or 'err'}: {msg}",
+                        )
+
+                    logger.csv_row([
+                        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        args.machine_id, batch_no, current_type,
+                        r.video_id, r.link, r.status, r.error_type,
+                        r.s3_url, r.bytes_uploaded,
+                        round(r.elapsed_sec, 2), (r.error or "")[:200],
+                    ])
+
                     batch_progress.advance(task_id, 1)
                     live.update(render())
+
+            ok = sum(1 for r in results if r.status == "success")
+            sk = sum(1 for r in results if r.status == "skipped")
+            er = sum(1 for r in results if r.status == "error")
+            dt = time.time() - batch_t0
+            logger.emit(
+                "batch",
+                f"batch #{batch_no} done in {dt:.1f}s — "
+                f"[green]{ok} ok[/] / [yellow]{sk} skip[/] / [red]{er} fail[/]",
+            )
 
             payload = [
                 {
@@ -540,6 +665,7 @@ def run():
                 stats.server_stats = rep.get("stats") or stats.server_stats
             except Exception as e:
                 stats.last_error = f"report: {e}"[:120]
+                logger.emit("warn", f"report failed: {e}")
 
             batch_progress.update(task_id, visible=False)
             live.update(render())
