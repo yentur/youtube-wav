@@ -539,14 +539,28 @@ def run():
     s3 = S3Uploader(aws)
     console.print(f"[green]✓ AWS config loaded[/] (bucket=[bold]{aws['s3_bucket']}[/], region={aws.get('region')})")
 
+    # Cookies precedence: local --cookies (if usable) > server-provided > none.
     cookies_path, cookies_msg = resolve_cookies(args.cookies)
     if cookies_path:
         console.print(f"[green]✓ {cookies_msg}[/]")
     elif args.cookies:
-        console.print(f"[yellow]⚠ {cookies_msg}[/]")
-    else:
-        console.print(f"[dim]ℹ {cookies_msg}[/]")
-    args.cookies = cookies_path  # downstream sees "" when unusable
+        console.print(f"[yellow]⚠ {cookies_msg}[/] — falling back to server cookies if available")
+
+    if not cookies_path:
+        server_cookies = (config.get("cookies") or "").strip()
+        if server_cookies:
+            server_path = os.path.join(workdir, "server_cookies.txt")
+            with open(server_path, "w", encoding="utf-8") as f:
+                f.write(config["cookies"])
+            os.chmod(server_path, 0o600)
+            cookies_path = server_path
+            cookies_msg = f"using cookies from server ({len(server_cookies)} bytes)"
+            console.print(f"[green]✓ {cookies_msg}[/]")
+        else:
+            cookies_msg = "no cookies (server has none, public videos only)"
+            console.print(f"[dim]ℹ {cookies_msg}[/]")
+
+    args.cookies = cookies_path  # downstream sees "" only when truly nothing usable
 
     stats = SessionStats()
     current_type = "—"
