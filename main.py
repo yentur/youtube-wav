@@ -49,11 +49,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="YouTube WAV distributed downloader client")
     p.add_argument("--api", default=os.getenv("API_BASE_URL", "http://51.102.128.158:8000"),
                    help="Orchestrator base URL")
+    p.add_argument("--token", default=os.getenv("API_TOKEN", ""),
+                   help="Shared secret for the orchestrator (or env API_TOKEN)")
     p.add_argument("--machine-id", default=os.getenv("MACHINE_ID", socket.gethostname()),
                    help="Unique id for this client")
-    p.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", "64")),
+    p.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", "10")),
                    help="How many links to pull per batch")
-    p.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "8")),
+    p.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "4")),
                    help="Parallel downloads inside a batch")
     p.add_argument("--cookies", default=os.getenv("COOKIES_FILE", ""),
                    help="Path to a Netscape-format cookies.txt for YouTube (optional)")
@@ -150,10 +152,13 @@ class SessionStats:
 
 # ── Server API ─────────────────────────────────────────────────────────────────
 class ServerAPI:
-    def __init__(self, base_url: str, machine_id: str):
+    def __init__(self, base_url: str, machine_id: str, token: str):
         self.base_url = base_url.rstrip("/")
         self.machine_id = machine_id
         self.s = requests.Session()
+        if not token:
+            raise SystemExit("API token required: pass --token or set API_TOKEN.")
+        self.s.headers.update({"Authorization": f"Bearer {token}"})
 
     def _retry(self, fn, *, label: str, attempts: int = 5):
         delay = 1.0
@@ -445,7 +450,7 @@ def run():
         border_style="cyan",
     ))
 
-    api = ServerAPI(args.api, args.machine_id)
+    api = ServerAPI(args.api, args.machine_id, args.token)
     config = api.get_config()
     aws = config["aws"]
     s3 = S3Uploader(aws)

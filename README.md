@@ -27,6 +27,8 @@ sudo apt-get install -y ffmpeg     # required by yt-dlp WAV extraction
 ## Run
 
 ```bash
+export API_TOKEN='<shared secret from the orchestrator owner>'
+
 python main.py \
   --api http://51.102.128.158:8000 \
   --batch-size 10 \
@@ -34,8 +36,13 @@ python main.py \
   --machine-id $(hostname)
 ```
 
-All flags can also come from env vars: `API_BASE_URL`, `BATCH_SIZE`,
-`CONCURRENCY`, `MACHINE_ID`, `COOKIES_FILE`, `WORKDIR`.
+All flags can also come from env vars: `API_BASE_URL`, `API_TOKEN`,
+`BATCH_SIZE`, `CONCURRENCY`, `MACHINE_ID`, `COOKIES_FILE`, `WORKDIR`.
+
+The orchestrator hands out AWS credentials and link batches **only** to
+clients that present the right token via `Authorization: Bearer <token>`
+(or `X-API-Token`). Without it `/config`, `/batch`, `/report` all return
+`401`. Ask the operator for the token; never check it into git.
 
 ### Optional: cookies for age-restricted / region-locked videos
 
@@ -50,6 +57,7 @@ python main.py --cookies /path/to/www.youtube.com_cookies.txt
 | Flag             | Default                       | Meaning                              |
 |------------------|-------------------------------|--------------------------------------|
 | `--api`          | `http://51.102.128.158:8000`  | Orchestrator base URL                |
+| `--token`        | _(env `API_TOKEN`)_           | Shared secret for the orchestrator   |
 | `--machine-id`   | `$(hostname)`                 | Unique id reported back to server    |
 | `--batch-size`   | `10`                          | Links pulled per `/batch` call       |
 | `--concurrency`  | `4`                           | Parallel downloads inside a batch    |
